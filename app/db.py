@@ -26,6 +26,13 @@ def connect() -> psycopg.Connection:
     return psycopg.connect(require_database_url(), autocommit=True, row_factory=dict_row)
 
 
+def safe_error_message(exc: Exception) -> str:
+    msg = " ".join(str(exc).split())
+    msg = msg.replace(require_database_url(), "[redacted]") if is_configured() else msg
+    msg = msg[:160]
+    return msg or exc.__class__.__name__
+
+
 def ensure_schema() -> None:
     with connect() as con, con.cursor() as cur:
         cur.execute(
@@ -55,6 +62,18 @@ def ping() -> bool:
     with connect() as con, con.cursor() as cur:
         cur.execute("SELECT 1;")
         return cur.fetchone() is not None
+
+
+def check() -> tuple[bool, str | None]:
+    if not is_configured():
+        return False, None
+    try:
+        with connect() as con, con.cursor() as cur:
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+        return True, None
+    except Exception as exc:
+        return False, safe_error_message(exc)
 
 
 def insert_feedback(

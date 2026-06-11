@@ -45,6 +45,8 @@ FRONTEND_ORIGIN=https://your-frontend-project.vercel.app
 CORS_ALLOWED_ORIGINS=https://your-frontend-project.vercel.app,http://127.0.0.1:5500,http://localhost:5500
 ```
 
+For Vercel serverless deployments, a Supabase transaction/pooler-style Postgres connection string is recommended over a direct long-lived database host connection.
+
 ## Local Run
 
 ```bash

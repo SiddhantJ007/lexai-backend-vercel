@@ -272,12 +272,17 @@ def save_feedback_row(session_id: str, original_prompt: str, translated_text: st
         )
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"Feedback storage is unavailable: {feedback_db.safe_error_message(exc)}") from exc
 
 
 @app.on_event("startup")
 def startup() -> None:
     if feedback_db.is_configured():
-        feedback_db.ensure_schema()
+        try:
+            feedback_db.ensure_schema()
+        except Exception as exc:
+            print(f"Warning: feedback schema initialization skipped: {feedback_db.safe_error_message(exc)}")
 
 
 @app.get("/")
@@ -291,16 +296,21 @@ def ping() -> dict[str, str]:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, bool]:
-    try:
-        db_ok = feedback_db.ping() if feedback_db.is_configured() else False
-    except Exception:
-        db_ok = False
-    return {"ok": True, "database_configured": feedback_db.is_configured(), "database_ok": db_ok}
+def healthz() -> dict[str, bool | str | None]:
+    db_configured = feedback_db.is_configured()
+    db_ok, db_error = feedback_db.check()
+    payload: dict[str, bool | str | None] = {
+        "ok": True,
+        "database_configured": db_configured,
+        "database_ok": db_ok,
+    }
+    if db_error:
+        payload["database_error"] = db_error
+    return payload
 
 
 @app.get("/health")
-def health() -> dict[str, bool]:
+def health() -> dict[str, bool | str | None]:
     return healthz()
 
 
@@ -355,6 +365,8 @@ def feedbacks(session_id: str = Header(..., alias="X-Lex-Session")) -> list[dict
         rows = feedback_db.list_feedbacks(session_id)
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"Feedback storage is unavailable: {feedback_db.safe_error_message(exc)}") from exc
     return [
         {
             "original_prompt": row["original_prompt"],
@@ -373,6 +385,8 @@ def clear_feedbacks(session_id: str = Header(..., alias="X-Lex-Session")) -> dic
         deleted = feedback_db.clear_feedbacks(session_id)
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"Feedback storage is unavailable: {feedback_db.safe_error_message(exc)}") from exc
     return {"deleted": deleted}
 
 
@@ -382,6 +396,8 @@ def download_feedbacks(session_id: str = Header(..., alias="X-Lex-Session")) -> 
         rows = feedback_db.list_feedbacks(session_id)
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"Feedback storage is unavailable: {feedback_db.safe_error_message(exc)}") from exc
     if not rows:
         raise HTTPException(404, "No feedback rows available")
 

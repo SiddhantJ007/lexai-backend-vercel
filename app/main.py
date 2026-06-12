@@ -545,7 +545,7 @@ def feedbacks(
             "translated_text": row["translated_text"],
             "target_language": language_name(row["target_language"]),
             "feedback": row["feedback"],
-            "created_at": row["created_at"],
+            "created_at": str(row["created_at"]),
         }
         for row in rows
     ]

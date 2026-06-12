@@ -198,8 +198,8 @@ def translate_with_deepl(text: str, target_language: str) -> str:
         try:
             response = requests.post(
                 url,
+                headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
                 data={
-                    "auth_key": DEEPL_API_KEY,
                     "text": text,
                     "target_lang": target_language.upper(),
                     "formality": "prefer_less",

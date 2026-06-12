@@ -25,7 +25,7 @@ from app.utils import critique_allowed
 from app.utils_pdf import extract_text_from_pdf
 
 MAX_UPLOAD_SIZE: Final = 4_000_000
-ANON_QUOTA_DAY: Final = int(os.getenv("ANON_QUOTA_DAY", "25000"))
+ANON_QUOTA_DAY: Final = int(os.getenv("ANON_QUOTA_DAY", "10000"))
 ET_ZONE: Final = ZoneInfo("America/New_York")
 
 LANGUAGE_NAMES = {

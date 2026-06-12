@@ -381,9 +381,14 @@ def rewrite_from_critique(
             {
                 "role": "system",
                 "content": (
-                    "You improve the English source based on critique while preserving the factual intent. "
+                    "You improve the English source based on critique while preserving the original meaning exactly. "
+                    "The critique is guidance about tone, local resonance, clarity, or persuasion. "
+                    "It is not new source material and must not replace the original concept, image, promise, or call to action. "
+                    "Do not swap the core noun, core verb, or central metaphor unless the critique explicitly asks for that exact change. "
+                    "Keep the revised line back-translatable to the same meaning as the original. "
                     f"{distinct_clause}"
-                    "Apply the critique concretely, not cosmetically. Return only the improved English text."
+                    "Apply the critique concretely, but with minimal semantic drift. "
+                    "Prefer a focused edit over a full reinterpretation. Return only the improved English text."
                 ),
             },
             {
@@ -392,7 +397,12 @@ def rewrite_from_critique(
                     f"Original source:\n{original_prompt}\n\n"
                     f"Current output:\n{translated_text}\n\n"
                     f"Critique:\n{reason}\n\n"
-                    "If the critique is vague, still make at least one concrete wording improvement."
+                    "Rules:\n"
+                    "- Preserve the same meaning as the original source.\n"
+                    "- Treat the critique as optimization guidance only.\n"
+                    "- Do not translate or paraphrase the critique itself into the output.\n"
+                    "- If the critique is vague, make one small but concrete improvement without changing the concept.\n"
+                    "- Keep the output concise and suitable for the same target translation task."
                 ),
             },
         ],

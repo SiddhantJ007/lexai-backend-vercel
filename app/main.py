@@ -357,6 +357,49 @@ def qa_translation(source_english: str, translated_text: str, target_language: s
     return fix_response.output_text.strip()
 
 
+def normalized_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def rewrite_from_critique(
+    original_prompt: str,
+    translated_text: str,
+    reason: str,
+    model: str,
+    *,
+    force_distinct: bool = False,
+) -> str:
+    distinct_clause = (
+        "The revised English must be materially different in wording and sentence structure from the original. "
+        "Avoid reusing the same opening phrase or the same key adjective-verb pair. "
+        if force_distinct
+        else ""
+    )
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "You improve the English source based on critique while preserving the factual intent. "
+                    f"{distinct_clause}"
+                    "Apply the critique concretely, not cosmetically. Return only the improved English text."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Original source:\n{original_prompt}\n\n"
+                    f"Current output:\n{translated_text}\n\n"
+                    f"Critique:\n{reason}\n\n"
+                    "If the critique is vague, still make at least one concrete wording improvement."
+                ),
+            },
+        ],
+    )
+    return response.output_text.strip()
+
+
 def generate_variants(prompt: str, target_language: str, model: str) -> list[str]:
     response = client.responses.create(
         model=model,
@@ -638,29 +681,33 @@ def regenerate(req: RegenRequest, session_id: str = Header(..., alias="X-Lex-Ses
         f"Bad - {req.reason[:100]}",
     )
 
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "Improve the English source based on the critique while preserving its factual intent. "
-                    "Return only the improved English text."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Original source:\n{req.original_prompt}\n\n"
-                    f"Current output:\n{req.translated_text}\n\n"
-                    f"Critique:\n{req.reason}"
-                ),
-            },
-        ],
+    improved_prompt = rewrite_from_critique(
+        req.original_prompt.strip(),
+        req.translated_text.strip(),
+        req.reason.strip(),
+        model,
     )
-    improved_prompt = response.output_text.strip()
+    if normalized_text(improved_prompt) == normalized_text(req.original_prompt):
+        improved_prompt = rewrite_from_critique(
+            req.original_prompt.strip(),
+            req.translated_text.strip(),
+            req.reason.strip(),
+            model,
+            force_distinct=True,
+        )
+
     new_translation = translate_text(improved_prompt, req.target_language, model)
     new_translation = qa_translation(improved_prompt, new_translation, req.target_language, model)
+    if normalized_text(new_translation) == normalized_text(req.translated_text):
+        improved_prompt = rewrite_from_critique(
+            req.original_prompt.strip(),
+            req.translated_text.strip(),
+            req.reason.strip(),
+            model,
+            force_distinct=True,
+        )
+        new_translation = translate_text(improved_prompt, req.target_language, model)
+        new_translation = qa_translation(improved_prompt, new_translation, req.target_language, model)
     update_usage(session_id, len(improved_prompt) + len(new_translation))
     return {"improved_prompt": improved_prompt, "new_translation": new_translation}
 

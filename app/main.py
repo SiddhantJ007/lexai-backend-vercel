@@ -4,17 +4,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import csv
 import io
 import os
 import re
+from datetime import datetime
 from typing import Final, Literal
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, Response
 from openai import OpenAI
+from openpyxl import Workbook
 from pydantic import BaseModel, Field
 
 from app.api_emails import router as emails_router
@@ -23,6 +25,8 @@ from app.utils import critique_allowed
 from app.utils_pdf import extract_text_from_pdf
 
 MAX_UPLOAD_SIZE: Final = 4_000_000
+ANON_QUOTA_DAY: Final = int(os.getenv("ANON_QUOTA_DAY", "25000"))
+ET_ZONE: Final = ZoneInfo("America/New_York")
 
 LANGUAGE_NAMES = {
     "AR": "Arabic",
@@ -151,26 +155,83 @@ def language_name(code: str) -> str:
     return LANGUAGE_NAMES.get(code.upper(), code.upper())
 
 
-def translate_with_deepl(text: str, target_language: str) -> str | None:
+def today_et():
+    return datetime.now(ET_ZONE).date()
+
+
+def deepl_candidate_urls() -> list[str]:
+    configured = DEEPL_API_URL or "https://api-free.deepl.com/v2/translate"
+    free_url = "https://api-free.deepl.com/v2/translate"
+    paid_url = "https://api.deepl.com/v2/translate"
+
+    candidates: list[str] = []
+    for url in [configured]:
+        if url and url not in candidates:
+            candidates.append(url)
+
+    prefers_free = ":fx" in DEEPL_API_KEY
+    fallback_order = [free_url, paid_url] if prefers_free else [paid_url, free_url]
+    for url in fallback_order:
+        if url not in candidates:
+            candidates.append(url)
+    return candidates
+
+
+def short_http_error(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = payload.get("message") or payload.get("detail")
+            if message:
+                return str(message)[:160]
+    except ValueError:
+        pass
+    return f"HTTP {response.status_code}"
+
+
+def translate_with_deepl(text: str, target_language: str) -> str:
     if not DEEPL_API_KEY:
-        return None
-    response = requests.post(
-        DEEPL_API_URL,
-        data={
-            "auth_key": DEEPL_API_KEY,
-            "text": text,
-            "target_lang": target_language.upper(),
-            "formality": "prefer_less",
-        },
-        timeout=20,
-    )
-    if not response.ok:
-        raise HTTPException(502, f"DeepL request failed: {response.status_code}")
-    payload = response.json()
-    translations = payload.get("translations") or []
-    if not translations:
-        raise HTTPException(502, "DeepL returned no translations")
-    return translations[0]["text"]
+        raise HTTPException(503, "DeepL is not configured on the backend.")
+
+    errors: list[str] = []
+    for url in deepl_candidate_urls():
+        try:
+            response = requests.post(
+                url,
+                data={
+                    "auth_key": DEEPL_API_KEY,
+                    "text": text,
+                    "target_lang": target_language.upper(),
+                    "formality": "prefer_less",
+                },
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            errors.append(f"{url}: {exc.__class__.__name__}")
+            continue
+
+        if not response.ok:
+            errors.append(f"{url}: {short_http_error(response)}")
+            continue
+
+        try:
+            payload = response.json()
+        except ValueError:
+            errors.append(f"{url}: invalid JSON")
+            continue
+
+        translations = payload.get("translations") or []
+        if translations and translations[0].get("text"):
+            return str(translations[0]["text"]).strip()
+        errors.append(f"{url}: no translations returned")
+
+    detail = errors[0] if errors else "translation service unavailable"
+    if any("HTTP 403" in item or "Authorization failed" in item for item in errors):
+        detail = (
+            "DeepL rejected the request. Check whether the deployed key matches "
+            "the correct DeepL API endpoint (Free vs Pro) in Vercel env vars."
+        )
+    raise HTTPException(502, f"DeepL request failed: {detail}")
 
 
 def translate_with_openai(text: str, target_language: str, model: str) -> str:
@@ -214,6 +275,88 @@ def improve_prompt(prompt: str, model: str) -> str:
     return response.output_text.strip()
 
 
+def improve_for_translation(prompt: str, model: str) -> str:
+    source_length = len(prompt)
+    tolerance = max(5, int(source_length * 0.05))
+    matches = re.findall(
+        r"\$?\d[\d,]*(?:\.\d+)?%?|[A-Z][A-Za-z0-9&@\-\']*(?:\s+[A-Z][A-Za-z0-9&@\-\']*)*",
+        prompt,
+    )
+    locks = ", ".join(sorted(set(matches))[:15])
+    system = (
+        "You refine short marketing or product copy before translation. "
+        "Keep meaning identical. Preserve names, numerals, dates, prices, promo codes, and claims."
+    )
+    user = (
+        f"ORIGINAL ({source_length} chars):\n{prompt}\n\n"
+        f"DO NOT CHANGE verbatim: {locks or 'none'}\n\n"
+        f"Constraints:\n"
+        f"- Final length within plus or minus {tolerance} characters.\n"
+        "- No new claims, no deletions.\n"
+        "- Return exactly one improved English paragraph."
+    )
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    improved = response.output_text.strip()
+    if abs(len(improved) - source_length) > tolerance:
+        return prompt
+    return improved
+
+
+def qa_translation(source_english: str, translated_text: str, target_language: str, model: str) -> str:
+    target_name = language_name(target_language)
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a bilingual QA checker. Compare the English source and target text. "
+                    "Reply exactly OK if the target is faithful, otherwise reply exactly: FIX: <short reason>."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"SOURCE (English):\n{source_english}\n\n"
+                    f"TARGET ({target_name}):\n{translated_text}"
+                ),
+            },
+        ],
+    )
+    verdict = response.output_text.strip()
+    if not verdict.startswith("FIX:"):
+        return translated_text
+
+    fix_response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "Correct the translation so it faithfully matches the English source. "
+                    "Return only the corrected translation."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Reason:\n{verdict}\n\n"
+                    f"English source:\n{source_english}\n\n"
+                    f"Current target text:\n{translated_text}\n\n"
+                    f"Target language: {target_name}"
+                ),
+            },
+        ],
+    )
+    return fix_response.output_text.strip()
+
+
 def generate_variants(prompt: str, target_language: str, model: str) -> list[str]:
     response = client.responses.create(
         model=model,
@@ -255,10 +398,21 @@ def generate_variants(prompt: str, target_language: str, model: str) -> list[str
 def translate_text(text: str, target_language: str, model: str) -> str:
     if target_language.upper() == "EN":
         return text
-    deepl_result = translate_with_deepl(text, target_language)
-    if deepl_result:
-        return deepl_result.strip()
-    return translate_with_openai(text, target_language, model)
+    return translate_with_deepl(text, target_language).strip()
+
+
+def update_usage(session_id: str, chars: int) -> None:
+    try:
+        current = feedback_db.get_session_usage(session_id, today_et())
+        if current + chars > ANON_QUOTA_DAY:
+            raise HTTPException(429, f"Daily quota exceeded ({ANON_QUOTA_DAY:,} characters)")
+        feedback_db.increment_session_usage(session_id, today_et(), chars)
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"Feedback storage is unavailable: {feedback_db.safe_error_message(exc)}") from exc
 
 
 def save_feedback_row(session_id: str, original_prompt: str, translated_text: str, target_language: str, feedback: str) -> None:
@@ -314,11 +468,24 @@ def health() -> dict[str, bool | str | None]:
     return healthz()
 
 
+@app.get("/quota")
+def quota(session_id: str = Header(..., alias="X-Lex-Session")) -> dict[str, int | str]:
+    try:
+        used = feedback_db.get_session_usage(session_id, today_et())
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(503, f"Feedback storage is unavailable: {feedback_db.safe_error_message(exc)}") from exc
+    return {"limit": ANON_QUOTA_DAY, "used": used, "day": today_et().isoformat()}
+
+
 @app.post("/full-process/")
-def full_process(req: FullProcessRequest) -> dict[str, str]:
+def full_process(req: FullProcessRequest, session_id: str = Header(..., alias="X-Lex-Session")) -> dict[str, str]:
     model = chosen_model(req.model)
-    improved = improve_prompt(req.prompt.strip(), model)
+    improved = improve_for_translation(req.prompt.strip(), model)
     translated = translate_text(improved, req.target_language, model)
+    translated = qa_translation(improved, translated, req.target_language, model)
+    update_usage(session_id, len(improved) + len(translated))
     return {"translated_text": translated}
 
 
@@ -330,9 +497,11 @@ def rephrase(req: RephraseRequest) -> dict[str, str]:
 
 
 @app.post("/copy-variants/")
-def copy_variants(req: VariantsRequest) -> dict[str, list[str]]:
+def copy_variants(req: VariantsRequest, session_id: str = Header(..., alias="X-Lex-Session")) -> dict[str, list[str]]:
     model = chosen_model(req.model)
-    return {"variants": generate_variants(req.prompt.strip(), req.target_language, model)}
+    variants = generate_variants(req.prompt.strip(), req.target_language, model)
+    update_usage(session_id, sum(len(item) for item in variants))
+    return {"variants": variants}
 
 
 @app.post("/feedback/")
@@ -360,9 +529,12 @@ def variant_feedback(req: VariantFeedbackRequest, session_id: str = Header(..., 
 
 
 @app.get("/feedbacks/")
-def feedbacks(session_id: str = Header(..., alias="X-Lex-Session")) -> list[dict[str, str]]:
+def feedbacks(
+    include_variants: bool = False,
+    session_id: str = Header(..., alias="X-Lex-Session"),
+) -> list[dict[str, str]]:
     try:
-        rows = feedback_db.list_feedbacks(session_id)
+        rows = feedback_db.list_feedbacks(session_id, include_variants=include_variants)
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
@@ -391,9 +563,17 @@ def clear_feedbacks(session_id: str = Header(..., alias="X-Lex-Session")) -> dic
 
 
 @app.get("/feedbacks/download")
-def download_feedbacks(session_id: str = Header(..., alias="X-Lex-Session")) -> Response:
+def download_feedbacks(
+    type: Literal["Good", "Bad"] | None = None,
+    include_variants: bool = False,
+    session_id: str = Header(..., alias="X-Lex-Session"),
+) -> Response:
     try:
-        rows = feedback_db.list_feedbacks(session_id)
+        rows = feedback_db.list_feedbacks(
+            session_id,
+            include_variants=include_variants,
+            feedback_prefix=type,
+        )
     except RuntimeError as exc:
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
@@ -401,24 +581,27 @@ def download_feedbacks(session_id: str = Header(..., alias="X-Lex-Session")) -> 
     if not rows:
         raise HTTPException(404, "No feedback rows available")
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["ID", "Prompt", "Output", "Language", "Feedback", "Created At"])
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "LexAi Feedback"
+    sheet.append(["ID", "Prompt", "Output", "Language", "Feedback", "Created At"])
     for index, row in enumerate(rows, start=1):
-        writer.writerow(
+        sheet.append(
             [
                 index,
                 row["original_prompt"],
                 row["translated_text"],
                 language_name(row["target_language"]),
                 row["feedback"],
-                row["created_at"],
+                str(row["created_at"]),
             ]
         )
+    output = io.BytesIO()
+    book.save(output)
     return Response(
         content=output.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="lexai_feedbacks.csv"'},
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="lexai_feedbacks.xlsx"'},
     )
 
 
@@ -447,6 +630,14 @@ def regenerate(req: RegenRequest, session_id: str = Header(..., alias="X-Lex-Ses
         raise HTTPException(400, "Critique was flagged as unsafe")
 
     model = chosen_model(req.model)
+    save_feedback_row(
+        session_id,
+        req.original_prompt.strip(),
+        req.translated_text.strip(),
+        req.target_language,
+        f"Bad - {req.reason[:100]}",
+    )
+
     response = client.responses.create(
         model=model,
         input=[
@@ -469,14 +660,8 @@ def regenerate(req: RegenRequest, session_id: str = Header(..., alias="X-Lex-Ses
     )
     improved_prompt = response.output_text.strip()
     new_translation = translate_text(improved_prompt, req.target_language, model)
-
-    save_feedback_row(
-        session_id,
-        req.original_prompt.strip(),
-        req.translated_text.strip(),
-        req.target_language,
-        f"Bad - {req.reason[:100]}",
-    )
+    new_translation = qa_translation(improved_prompt, new_translation, req.target_language, model)
+    update_usage(session_id, len(improved_prompt) + len(new_translation))
     return {"improved_prompt": improved_prompt, "new_translation": new_translation}
 
 

@@ -4,7 +4,7 @@ Backend-only FastAPI deployment repo for the public LexAi recruiter demo.
 
 ## Structure
 
-- `app.py`: Vercel/Python entrypoint exposing `app`
+- `index.py`: Vercel/Python entrypoint exposing `app`
 - `app/`: FastAPI application modules
 - `requirements.txt`
 - `.python-version`
@@ -22,6 +22,7 @@ Backend-only FastAPI deployment repo for the public LexAi recruiter demo.
 - `GET /feedbacks/download`
 - `POST /feedback/regenerate`
 - `POST /api/generate-emails`
+- `GET /quota`
 - `GET /healthz`
 - `GET /health`
 
@@ -43,9 +44,14 @@ DATABASE_URL=postgresql://user:password@host:5432/database
 SUPABASE_DB_URL=postgresql://user:password@host:5432/database
 FRONTEND_ORIGIN=https://your-frontend-project.vercel.app
 CORS_ALLOWED_ORIGINS=https://your-frontend-project.vercel.app,http://127.0.0.1:5500,http://localhost:5500
+ANON_QUOTA_DAY=25000
 ```
 
 For Vercel serverless deployments, a Supabase transaction/pooler-style Postgres connection string is recommended over a direct long-lived database host connection.
+If DeepL returns `403`, verify that the Vercel project is using the correct endpoint for the deployed key:
+
+- DeepL Free keys usually require `https://api-free.deepl.com/v2/translate`
+- DeepL Pro keys use `https://api.deepl.com/v2/translate`
 
 ## Local Run
 
@@ -54,7 +60,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-uvicorn app:app --reload
+uvicorn index:app --reload
 ```
 
 ## Vercel
@@ -62,7 +68,7 @@ uvicorn app:app --reload
 - Framework Preset: `Other`
 - Root Directory: repo root
 - No `vercel.json` required for the first deployment attempt
-- Python entrypoint: `app.py`
+- Python entrypoint: `index.py`
 
 ## Health Check
 
